@@ -71,7 +71,7 @@ jr_move() {
   local ticket=$1 status=$2
   local transitions tid
 
-  transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
+  transitions=$(_jr_api GET "/issue/$ticket/transitions") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
   local result
   result=$(python3 -c "
 import json, sys
@@ -145,7 +145,7 @@ jr() {
   local cmd=${1:-help}
   shift 2>/dev/null || true
   case "$cmd" in
-    move)         jr_move        "$@" ;;
+    move|mv)      jr_move        "$@" ;;
     comment)      jr_comment     "$@" ;;
     transitions)  jr_transitions "$@" ;;
     help|--help|-h) jr_help  ;;
