@@ -6,7 +6,7 @@ _jr_check_env() {
   [[ -z "${JIRA_BASE:-}"             ]] && missing+=(JIRA_BASE)
   [[ -z "${JIRA_EMAIL:-}"            ]] && missing+=(JIRA_EMAIL)
   [[ -z "${JIRA_TOKEN:-}"            ]] && missing+=(JIRA_TOKEN)
-  [[ -z "${JIRA_PROJECT_PREFIXES:-}" ]] && missing+=(JIRA_PROJECT_PREFIXES)
+  JIRA_PROJECT_PREFIXES=${JIRA_PROJECT_PREFIXES:-MT|DOS}
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "jr: missing env vars: ${missing[*]}" >&2
     echo "    Set them in ~/.bashrc or source a .env file" >&2
@@ -225,7 +225,7 @@ Required env vars:
   JIRA_BASE             https://yourcompany.atlassian.net
   JIRA_EMAIL            your@email.com
   JIRA_TOKEN            your-api-token
-  JIRA_PROJECT_PREFIXES pipe-separated project keys (e.g. MT|DOS) — lets you use bare numbers as ticket IDs
+  JIRA_PROJECT_PREFIXES pipe-separated project keys (default: MT|DOS)
 EOF
 }
 
