@@ -78,7 +78,22 @@ jr_move() {
   ticket=$(_jr_resolve_ticket "$1"); status=$2
   local transitions tid
 
-  transitions=$(_jr_api GET "/issue/$ticket/transitions") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+  local issue
+  issue=$(_jr_api GET "/issue/$ticket?fields=assignee") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+  local assignee
+  assignee=$(python3 -c "
+import json, sys
+a = json.loads(sys.argv[1]).get('fields', {}).get('assignee') or {}
+print(a.get('emailAddress', ''))
+" "$issue")
+  if [[ -n "$assignee" && "$assignee" != "$JIRA_EMAIL" ]]; then
+    echo "jr: $ticket is assigned to $assignee, not you."
+    read -r -p "Move anyway? [y/N] " confirm
+    [[ "${confirm,,}" == "y" ]] || { echo "aborted." >&2; return 1; }
+  fi
+
+  local transitions
+  transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
   local result
   result=$(python3 -c "
 import json, sys
