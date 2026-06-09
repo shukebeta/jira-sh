@@ -76,11 +76,11 @@ jr_move() {
 import json, sys
 target = sys.argv[1].lower()
 for t in json.loads(sys.argv[2]).get('transitions', []):
-    if t['name'].lower() == target:
+    if t.get('to', {}).get('name', '').lower() == target or t['name'].lower() == target:
         print(t['id']); sys.exit(0)
 sys.exit(1)
 " "$status" "$transitions") || {
-    echo "jr: no transition named '$status'. Available:" >&2
+    echo "jr: no transition to '$status'. Available targets:" >&2
     _jr_transition_names "$transitions" >&2
     return 1
   }
@@ -105,7 +105,8 @@ jr_transitions() {
   python3 -c "
 import json, sys
 for t in json.loads(sys.argv[1]).get('transitions', []):
-    print(f\"  {t['name']:30s}  (id: {t['id']})\")
+    dest = t.get('to', {}).get('name', '')
+    print(f\"  {dest:25s} <- {t['name']}\")
 " "$transitions"
 }
 
