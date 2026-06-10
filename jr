@@ -53,6 +53,16 @@ _jr_auth() {
   echo -n "$JIRA_EMAIL:$JIRA_TOKEN" | base64 | tr -d '\n'
 }
 
+# Print the current Jira user's accountId and displayName on two lines.
+_jr_myself() {
+  _jr_api GET "/myself" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('accountId', ''))
+print(d.get('displayName', ''))
+"
+}
+
 _jr_api() {
   local method=$1 path=$2 data=${3:-}
   local url="$JIRA_BASE/rest/api/3$path"
@@ -128,44 +138,32 @@ cmd_move() {
   local ticket status
   ticket=$(_jr_resolve_ticket "$1") || return 1; status=$2
 
-  local issue
-  issue=$(_jr_api GET "/issue/$ticket?fields=assignee") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
-  local assignee
-  assignee=$(echo "$issue" | python3 -c "
-import json, sys
-a = json.loads(sys.stdin.read()).get('fields', {}).get('assignee') or {}
-print(a.get('emailAddress', ''))
-")
-  if [[ -n "$assignee" && "$assignee" != "$JIRA_EMAIL" ]]; then
-    echo "jr: $ticket is assigned to $assignee, not you."
-    read -r -p "Move anyway? [y/N] " confirm
-    [[ "${confirm,,}" == "y" ]] || { echo "aborted." >&2; return 1; }
-  fi
-
+  # Resolve the transition (and its destination name) first.
   local transitions
-  transitions=$(_jr_api GET "/issue/$ticket/transitions") || return 1
+  transitions=$(_jr_api GET "/issue/$ticket/transitions") || { echo "jr: ticket not found: $ticket" >&2; return 1; }
   local result
   result=$(echo "$transitions" | python3 -c "
 import json, sys
 target = sys.argv[1].lower()
 ts = json.loads(sys.stdin.read()).get('transitions', [])
+def emit(t): print('OK:%s:%s' % (t['id'], t.get('to', {}).get('name', '')))
 for t in ts:
     dest = t.get('to', {}).get('name', '').lower()
     if dest == target or t['name'].lower() == target:
-        print('OK:' + t['id']); sys.exit(0)
+        emit(t); sys.exit(0)
 words = target.split()
 matches = [t for t in ts if all(w in t.get('to', {}).get('name', '').lower() for w in words)]
 if len(matches) == 1:
-    print('OK:' + matches[0]['id']); sys.exit(0)
+    emit(matches[0]); sys.exit(0)
 if len(matches) > 1:
-    print('AMBIGUOUS:' + ', '.join(t.get('to',{}).get('name','') for t in matches))
+    print('AMBIGUOUS:' + ', '.join(t.get('to', {}).get('name', '') for t in matches))
 else:
     print('NONE:')
 " "$status")
 
-  local tid
+  local tid dest
   case "$result" in
-    OK:*)        tid=${result#OK:} ;;
+    OK:*)        dest=${result#OK:*:}; tid=${result#OK:}; tid=${tid%%:*} ;;
     AMBIGUOUS:*) echo "jr: '$status' is ambiguous: ${result#AMBIGUOUS:}" >&2; return 1 ;;
     *)           echo "jr: no transition to '$status'. Available targets:" >&2
                  echo "$transitions" | python3 -c "
@@ -175,8 +173,38 @@ for t in json.loads(sys.stdin.read()).get('transitions', []):
 " >&2; return 1 ;;
   esac
 
-  _jr_do_transition "$ticket" "$tid" "$status" || return 1
-  echo "$ticket → $status"
+  # Current assignee — accountId is reliable even when Jira hides the email.
+  local a_id a_email
+  { read -r a_id; read -r a_email; } < <(_jr_api GET "/issue/$ticket?fields=assignee" | python3 -c "
+import json, sys
+a = json.loads(sys.stdin.read()).get('fields', {}).get('assignee') or {}
+print(a.get('accountId', ''))
+print(a.get('emailAddress', ''))
+")
+
+  if [[ "${dest,,}" == *"in progress"* ]]; then
+    # Starting work claims the ticket: take it if unassigned, refuse if it's
+    # someone else's, no-op if it's already yours.
+    local me_id me_name
+    { read -r me_id; read -r me_name; } < <(_jr_myself)
+    [[ -n "$me_id" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
+    if [[ -z "$a_id" ]]; then
+      _jr_api PUT "/issue/$ticket/assignee" "{\"accountId\":\"$me_id\"}" > /dev/null \
+        || { echo "jr: failed to assign $ticket to you" >&2; return 1; }
+      echo "$ticket → assigned to you (${me_name:-current user})"
+    elif [[ "$a_id" != "$me_id" ]]; then
+      echo "jr: $ticket is assigned to ${a_email:-someone else}, not you — not moving to '$dest'." >&2
+      echo "    Re-assign it to yourself first if you're taking over." >&2
+      return 1
+    fi
+  elif [[ -n "$a_email" && "$a_email" != "$JIRA_EMAIL" ]]; then
+    echo "jr: $ticket is assigned to $a_email, not you."
+    read -r -p "Move anyway? [y/N] " confirm
+    [[ "${confirm,,}" == "y" ]] || { echo "aborted." >&2; return 1; }
+  fi
+
+  _jr_do_transition "$ticket" "$tid" "$dest" || return 1
+  echo "$ticket → $dest"
 }
 
 cmd_comment() {
@@ -717,9 +745,21 @@ else:
 }
 
 cmd_assign() {
-  [[ $# -lt 2 ]] && { echo "Usage: jr assign <TICKET> <NAME>" >&2; return 1; }
+  [[ $# -lt 1 ]] && { echo "Usage: jr assign <TICKET> [NAME]   (NAME omitted = assign to yourself)" >&2; return 1; }
   local ticket
   ticket=$(_jr_resolve_ticket "$1") || return 1
+
+  # No name → assign to the current user.
+  if [[ -z "${2:-}" ]]; then
+    local me_id me_name
+    { read -r me_id; read -r me_name; } < <(_jr_myself)
+    [[ -n "$me_id" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
+    _jr_api PUT "/issue/$ticket/assignee" "{\"accountId\":\"$me_id\"}" > /dev/null \
+      || { echo "jr: failed to assign $ticket to you" >&2; return 1; }
+    echo "$ticket → assigned to you (${me_name:-current user})"
+    return 0
+  fi
+
   local query=$2
   local result
   result=$(_jr_api GET "/user/assignable/search?issueKey=${ticket}&query=${query}&maxResults=10") || {
@@ -891,13 +931,13 @@ cmd_help() {
 Usage: jr <command> [args]
 
 Commands:
-  move        <TICKET> <STATUS>   Transition a ticket to a new status
+  move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   transitions <TICKET>            List available transitions for a ticket
-  assign      <TICKET> <NAME>     Assign ticket to a user (fuzzy name/email match)
+  assign      <TICKET> [NAME]     Assign ticket to a user (fuzzy name/email match); NAME omitted = assign to yourself
   users       <TICKET> [query]    List assignable users for a ticket
   help                            Show this help
 
