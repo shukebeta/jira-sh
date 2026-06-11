@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # jr - Jira Cloud CLI
 
+# On Windows, python's text-mode stdout translates \n to \r\n, and bash's
+# `read`/`$()` keep the trailing \r — silently poisoning every value we capture
+# (breaks string compares, embeds \r in JSON, garbles output via carriage
+# returns). Strip it at the single source so callers never see it.
+python3() { command python3 "$@" | tr -d '\r'; }
+
 _jr_check_env() {
   local missing=()
   [[ -z "${JIRA_BASE:-}"  ]] && missing+=(JIRA_BASE)
@@ -182,12 +188,15 @@ print(a.get('accountId', ''))
 print(a.get('emailAddress', ''))
 ")
 
+  # Identify the current user by accountId — reliable even when Jira hides the
+  # assignee's email, so we never depend on $JIRA_EMAIL matching what Jira reports.
+  local me_id me_name
+  { read -r me_id; read -r me_name; } < <(_jr_myself)
+  [[ -n "$me_id" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
+
   if [[ "${dest,,}" == *"in progress"* ]]; then
     # Starting work claims the ticket: take it if unassigned, refuse if it's
     # someone else's, no-op if it's already yours.
-    local me_id me_name
-    { read -r me_id; read -r me_name; } < <(_jr_myself)
-    [[ -n "$me_id" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
     if [[ -z "$a_id" ]]; then
       _jr_api PUT "/issue/$ticket/assignee" "{\"accountId\":\"$me_id\"}" > /dev/null \
         || { echo "jr: failed to assign $ticket to you" >&2; return 1; }
@@ -197,8 +206,8 @@ print(a.get('emailAddress', ''))
       echo "    Re-assign it to yourself first if you're taking over." >&2
       return 1
     fi
-  elif [[ -n "$a_email" && "$a_email" != "$JIRA_EMAIL" ]]; then
-    echo "jr: $ticket is assigned to $a_email, not you."
+  elif [[ -n "$a_id" && "$a_id" != "$me_id" ]]; then
+    echo "jr: $ticket is assigned to ${a_email:-someone else}, not you."
     read -r -p "Move anyway? [y/N] " confirm
     [[ "${confirm,,}" == "y" ]] || { echo "aborted." >&2; return 1; }
   fi
