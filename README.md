@@ -15,6 +15,8 @@ bash ~/Projects/jira-sh/install.sh
 export JIRA_BASE=https://yourcompany.atlassian.net
 export JIRA_EMAIL=your@email.com
 export JIRA_TOKEN=your-api-token
+# Optional: pipe-separated project keys for resolving bare ticket numbers (default: MT|DOS)
+export JIRA_PROJECT_PREFIXES="MT|DOS"
 
 # 4. Reload
 source ~/.bashrc
@@ -25,7 +27,58 @@ source ~/.bashrc
 ```bash
 jr move PROJ-123 "In Review"
 jr comment PROJ-123 "Deployed to staging"
+jr view PROJ-123
 jr help
+```
+
+A bare `.`, `@`, or an omitted `TICKET` derives the ticket from the current
+branch name (e.g. on `feature/mt-63504` you can just run `jr view`). A bare
+number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
+| `comment <TICKET> <TEXT>` | Add a comment. |
+| `view [TICKET]` | Show a ticket's fields and full rendered description. |
+| `resolve [--force] [TICKET]` | Move to review, then fill the review template comment from the current branch's PR. |
+| `approve [--force] [--no-sql] [--no-jenkins] [TICKET]` | Finish review, then fill the Code Review Checklist (see below). |
+| `merge [--force] [TICKET]` | Merge the approved PR, move Merge → Test in Main, then fill the Merge Results template. |
+| `transitions <TICKET>` | List available transitions. |
+| `assign <TICKET> [NAME]` | Assign to a user (fuzzy name/email match); NAME omitted = assign to yourself. |
+| `users <TICKET> [query]` | List assignable users. |
+
+## Review workflow
+
+The three workflow commands fill the Jira templates the team's automation posts
+on each transition, so you don't hand-edit ADF tables:
+
+```
+jr resolve   → Review            (fill the Resolved comment from the PR)
+jr approve   → Test in Branch    (fill the Code Review Checklist)
+jr merge     → Test in Main      (fill the Merge Results table)
+```
+
+Each is idempotent: if the ticket is already in the target status the move is
+skipped and the comment is still filled. A checklist already authored by someone
+else is left untouched; an already-filled comment is not overwritten unless you
+pass `--force`.
+
+### `jr approve`
+
+Moves Review → Test in Branch, then fills the auto-generated **Code Review
+Checklist** comment: ticks the **Done** column, keeps the first three rows plus
+the last, blanks **Comments**, and reduces the **Action** line to *Ready for
+test*. Not every ticket touches SQL and not every project runs Jenkins, so those
+rows can be dropped:
+
+```bash
+jr approve              # keep both rows (default)
+jr approve --no-sql     # drop the SQL Standards row
+jr approve --no-jenkins # drop the Jenkins pipelines row
+jr approve -sj          # short forms bundle: -s (no-sql) -j (no-jenkins) -f (force)
+jr approve -sjf MT-63504 # skip both rows and overwrite a filled checklist
 ```
 
 ## Requirements
@@ -34,15 +87,18 @@ jr help
 - curl
 - python3
 
-Core commands (`move`, `comment`, `transitions`, `assign`, `users`) use the
-Python standard library only.
+Core commands (`move`, `comment`, `view`, `approve`, `transitions`, `assign`,
+`users`) use the Python standard library only.
 
-The `jr resolve` command additionally needs:
+The `jr resolve` and `jr merge` commands additionally need:
 
 - [`gh`](https://cli.github.com/) — the GitHub CLI, authenticated for the repo's
   owner. If you use a multi-account `gh` wrapper that routes by repo owner, make
   sure the right account is selected (e.g. `GH_PROFILE=work`), or `gh pr view`
   will 404 on private org repos.
+
+The `jr resolve` command also needs:
+
 - [`mistune`](https://pypi.org/project/mistune/) — renders the PR description
   (Markdown) into Jira's ADF format. Install with `pip install mistune`. If it's
   missing, `jr resolve` exits with a hint rather than posting raw Markdown.
