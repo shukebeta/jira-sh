@@ -723,6 +723,204 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
   done
 }
 
+# Build the filled "Code Review Checklist" comment ADF (blue template). If a
+# template comment's ADF is passed in REVIEW_TEMPLATE, transform it in place —
+# keep the first 3 and the last data row, drop the rest, tick the Done column,
+# blank the Comments column, and reduce the Action line to "Ready for test".
+# Without a template (REVIEW_TEMPLATE empty) build the checklist from scratch.
+_jr_approve_adf() {
+  REVIEW_TEMPLATE="${REVIEW_TEMPLATE:-}" python3 <<'PYEOF'
+import json, os
+
+FLAG  = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
+CHECK = {"type": "emoji", "attrs": {"shortName": ":check_mark:", "id": "atlassian-check_mark", "text": ":check_mark:"}}
+
+def find_table(node):
+    if isinstance(node, dict):
+        if node.get("type") == "table":
+            return node
+        for v in node.get("content", []):
+            r = find_table(v)
+            if r: return r
+    elif isinstance(node, list):
+        for v in node:
+            r = find_table(v)
+            if r: return r
+    return None
+
+def done_cell():
+    return {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [CHECK]}]}
+
+def empty_cell():
+    return {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph"}]}
+
+def set_action(doc):
+    for node in doc.get("content", []):
+        if node.get("type") == "paragraph":
+            txt = "".join(t.get("text", "") for t in node.get("content", []) if t.get("type") == "text")
+            if txt.strip().startswith("Action:"):
+                node["content"] = [{"type": "text", "text": "Action:", "marks": [{"type": "strong"}]},
+                                   {"type": "text", "text": " Ready for test"}]
+                return True
+    return False
+
+raw = os.environ.get("REVIEW_TEMPLATE", "").strip()
+doc = None
+if raw:
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict) and d.get("type") == "doc":
+            doc = d
+    except Exception:
+        doc = None
+
+tbl = find_table(doc) if doc else None
+if doc and tbl:
+    rows = tbl.get("content", [])
+    header, data = rows[:1], rows[1:]
+    n = len(data)
+    idxs = [i for i in (0, 1, 2) if i < n]
+    if n > 0 and (n - 1) not in idxs:
+        idxs.append(n - 1)
+    kept = [data[i] for i in idxs]
+    for row in kept:
+        cells = row.get("content", [])
+        if len(cells) >= 2: cells[1] = done_cell()
+        if len(cells) >= 3: cells[2] = empty_cell()
+    tbl["content"] = header + kept
+    if not set_action(doc):
+        doc.setdefault("content", []).append({"type": "paragraph", "content": [
+            {"type": "text", "text": "Action:", "marks": [{"type": "strong"}]},
+            {"type": "text", "text": " Ready for test"}]})
+    print(json.dumps({"body": doc}))
+else:
+    def header_cell(text):
+        return {"type": "tableHeader", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}]}]}
+    def area_cell(text):
+        return {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+    AREAS = ["Coding Standards", "Code functional",
+             "SQL Standards - script was already run in DFXDDT and in correct folder",
+             "Jenkins pipelines (passing if applicable)"]
+    rows = [{"type": "tableRow", "content": [header_cell("Area"), header_cell("Done"), header_cell("Comments")]}]
+    for a in AREAS:
+        rows.append({"type": "tableRow", "content": [area_cell(a), done_cell(), empty_cell()]})
+    table = {"type": "table", "attrs": {"isNumberColumnEnabled": False, "layout": "default"}, "content": rows}
+    content = [
+        {"type": "heading", "attrs": {"level": 2},
+         "content": [FLAG, {"type": "text", "text": " Code Review Checklist", "marks": [{"type": "textColor", "attrs": {"color": "#00bfff"}}]}]},
+        table,
+        {"type": "paragraph", "content": [{"type": "text", "text": "Action:", "marks": [{"type": "strong"}]}, {"type": "text", "text": " Ready for test"}]},
+    ]
+    print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
+PYEOF
+}
+
+# Classify the "Code Review Checklist" comments on a ticket. Reads the comment
+# list on stdin and my accountId as argv1; prints one of:
+#   TEMPLATE:<id>  unfilled template authored by me (Done column has no ticks yet)
+#   FILLED:<id>    a checklist I already ticked
+#   OTHER:<id>     a checklist authored by someone else (out of scope)
+#   NONE:          no Code Review Checklist comment at all
+# Mine takes precedence over someone else's; an unfilled template over a filled one.
+_jr_approve_state() {
+  python3 -c "
+import json, sys
+me = sys.argv[1]
+template = filled = other = None
+for c in json.load(sys.stdin).get('comments', []):
+    s = json.dumps(c.get('body', {}))
+    if 'atlassian-flag_on' not in s or 'Code Review Checklist' not in s:
+        continue
+    if (c.get('author') or {}).get('accountId') != me:
+        other = c['id']; continue
+    if 'atlassian-check_mark' in s:
+        filled = c['id']
+    else:
+        template = c['id']
+if template: print('TEMPLATE:' + template)
+elif filled: print('FILLED:' + filled)
+elif other:  print('OTHER:' + other)
+else:        print('NONE:')
+" "$1"
+}
+
+cmd_approve() {
+  local force=0 rest=()
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *)       rest+=("$a") ;;
+    esac
+  done
+  set -- "${rest[@]}"
+  local ticket
+  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
+
+  local me
+  me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
+  [[ -n "$me" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
+
+  # Move Review → Test in Branch first — unless it's already there.
+  local status
+  status=$(_jr_api GET "/issue/$ticket?fields=status" | python3 -c "
+import json, sys
+print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
+")
+  [[ -n "$status" ]] || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+  if [[ "${status,,}" == *"test in branch"* ]]; then
+    echo "$ticket already in '$status' — skipping move"
+  else
+    cmd_move "$ticket" "Test in Branch" || return 1
+  fi
+
+  # Moving to Test in Branch triggers the workflow's "Code Review Checklist"
+  # template, authored by us; poll for it and transform-fill it. If the only
+  # checklist present was authored by someone else, they already drove this
+  # transition — out of scope; leave it untouched.
+  local tries=10 state cid tbody body
+  while :; do
+    state=$(_jr_api GET "/issue/$ticket/comment" | _jr_approve_state "$me")
+    case "$state" in
+      TEMPLATE:*)
+        cid=${state#TEMPLATE:}
+        tbody=$(_jr_api GET "/issue/$ticket/comment/$cid" | python3 -c "import json, sys; print(json.dumps(json.load(sys.stdin).get('body', {})))")
+        body=$(REVIEW_TEMPLATE="$tbody" _jr_approve_adf) || return 1
+        _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$body" \
+          "failed to fill Code Review Checklist comment $cid on $ticket" || return 1
+        echo "$ticket → Code Review Checklist filled in (template $cid)"
+        return 0 ;;
+      FILLED:*)
+        cid=${state#FILLED:}
+        if [[ $force -eq 1 ]]; then
+          tbody=$(_jr_api GET "/issue/$ticket/comment/$cid" | python3 -c "import json, sys; print(json.dumps(json.load(sys.stdin).get('body', {})))")
+          body=$(REVIEW_TEMPLATE="$tbody" _jr_approve_adf) || return 1
+          _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$body" \
+            "failed to overwrite Code Review Checklist comment $cid on $ticket" || return 1
+          echo "$ticket → Code Review Checklist overwritten (--force, comment $cid)"
+          return 0
+        fi
+        echo "jr: $ticket already has a filled Code Review Checklist ($cid); not overwriting." >&2
+        echo "    Re-run with --force to replace it." >&2
+        return 1 ;;
+      OTHER:*)
+        echo "jr: $ticket has a Code Review Checklist authored by someone else — out of scope, leaving it untouched."
+        return 0 ;;
+      *)
+        if [[ $tries -gt 0 ]]; then
+          [[ $tries -eq 10 ]] && echo "jr: waiting for the Code Review Checklist template comment to appear…"
+          tries=$((tries - 1)); sleep 2; continue
+        fi
+        echo "jr: no template appeared; posting a new Code Review Checklist instead"
+        body=$(_jr_approve_adf) || return 1
+        _jr_comment_write POST "/issue/$ticket/comment" "$body" \
+          "failed to post Code Review Checklist to $ticket" || return 1
+        echo "$ticket → Code Review Checklist added"
+        return 0 ;;
+    esac
+  done
+}
+
 cmd_transitions() {
   [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
   local ticket
@@ -943,6 +1141,7 @@ Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
+  approve     [--force] [TICKET]  Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test)
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   transitions <TICKET>            List available transitions for a ticket
@@ -967,6 +1166,7 @@ case "$cmd" in
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
   resolve)        cmd_resolve     "$@" ;;
+  approve)        cmd_approve     "$@" ;;
   merge)          cmd_merge       "$@" ;;
   view)           cmd_view        "$@" ;;
   transitions)    cmd_transitions "$@" ;;
