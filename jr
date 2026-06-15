@@ -728,12 +728,17 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
 # keep the first 3 and the last data row, drop the rest, tick the Done column,
 # blank the Comments column, and reduce the Action line to "Ready for test".
 # Without a template (REVIEW_TEMPLATE empty) build the checklist from scratch.
+# KEEP_SQL/KEEP_JENKINS (default 1) drop the SQL / Jenkins rows when set to 0,
+# for tickets with no SQL changes or projects with no Jenkins pipeline.
 _jr_approve_adf() {
-  REVIEW_TEMPLATE="${REVIEW_TEMPLATE:-}" python3 <<'PYEOF'
+  REVIEW_TEMPLATE="${REVIEW_TEMPLATE:-}" KEEP_SQL="${KEEP_SQL:-1}" KEEP_JENKINS="${KEEP_JENKINS:-1}" python3 <<'PYEOF'
 import json, os
 
 FLAG  = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
 CHECK = {"type": "emoji", "attrs": {"shortName": ":check_mark:", "id": "atlassian-check_mark", "text": ":check_mark:"}}
+
+keep_sql     = os.environ.get("KEEP_SQL", "1") != "0"
+keep_jenkins = os.environ.get("KEEP_JENKINS", "1") != "0"
 
 def find_table(node):
     if isinstance(node, dict):
@@ -747,6 +752,28 @@ def find_table(node):
             r = find_table(v)
             if r: return r
     return None
+
+def node_text(n):
+    out = ""
+    if isinstance(n, dict):
+        if n.get("type") == "text":
+            out += n.get("text", "")
+        for v in n.get("content", []):
+            out += node_text(v)
+    elif isinstance(n, list):
+        for v in n:
+            out += node_text(v)
+    return out
+
+# A row is dropped if its Area names a section we were told to omit.
+def drop_row(row):
+    cells = row.get("content", [])
+    area = node_text(cells[0]).lower() if cells else ""
+    if not keep_sql and "sql" in area:
+        return True
+    if not keep_jenkins and "jenkins" in area:
+        return True
+    return False
 
 def done_cell():
     return {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [CHECK]}]}
@@ -782,7 +809,7 @@ if doc and tbl:
     idxs = [i for i in (0, 1, 2) if i < n]
     if n > 0 and (n - 1) not in idxs:
         idxs.append(n - 1)
-    kept = [data[i] for i in idxs]
+    kept = [data[i] for i in idxs if not drop_row(data[i])]
     for row in kept:
         cells = row.get("content", [])
         if len(cells) >= 2: cells[1] = done_cell()
@@ -798,9 +825,11 @@ else:
         return {"type": "tableHeader", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}]}]}
     def area_cell(text):
         return {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
-    AREAS = ["Coding Standards", "Code functional",
-             "SQL Standards - script was already run in DFXDDT and in correct folder",
-             "Jenkins pipelines (passing if applicable)"]
+    AREAS = ["Coding Standards", "Code functional"]
+    if keep_sql:
+        AREAS.append("SQL Standards - script was already run in DFXDDT and in correct folder")
+    if keep_jenkins:
+        AREAS.append("Jenkins pipelines (passing if applicable)")
     rows = [{"type": "tableRow", "content": [header_cell("Area"), header_cell("Done"), header_cell("Comments")]}]
     for a in AREAS:
         rows.append({"type": "tableRow", "content": [area_cell(a), done_cell(), empty_cell()]})
@@ -845,15 +874,18 @@ else:        print('NONE:')
 }
 
 cmd_approve() {
-  local force=0 rest=()
+  local force=0 keep_sql=1 keep_jenkins=1 rest=()
   local a
   for a in "$@"; do
     case "$a" in
-      --force) force=1 ;;
-      *)       rest+=("$a") ;;
+      --force)      force=1 ;;
+      --no-sql)     keep_sql=0 ;;
+      --no-jenkins) keep_jenkins=0 ;;
+      *)            rest+=("$a") ;;
     esac
   done
   set -- "${rest[@]}"
+  export KEEP_SQL="$keep_sql" KEEP_JENKINS="$keep_jenkins"
   local ticket
   ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
 
@@ -1141,7 +1173,9 @@ Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
-  approve     [--force] [TICKET]  Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test)
+  approve     [--force] [--no-sql] [--no-jenkins] [TICKET]
+                                  Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
+                                  --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
   transitions <TICKET>            List available transitions for a ticket
