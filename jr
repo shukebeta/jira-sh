@@ -226,6 +226,114 @@ cmd_comment() {
   echo "comment added to $ticket"
 }
 
+cmd_comments() {
+  local n=3 ticket_arg="."
+  local a
+  for a in "$@"; do
+    if [[ "$a" =~ ^[0-9]+$ ]]; then n=$a
+    else ticket_arg=$a
+    fi
+  done
+  local ticket
+  ticket=$(_jr_resolve_ticket "$ticket_arg") || return 1
+
+  _jr_api GET "/issue/$ticket/comment?orderBy=-created&maxResults=$n" | python3 -c "$(cat <<'PYEOF'
+import json, sys
+
+data = json.load(sys.stdin)
+comments = list(reversed(data.get('comments', [])))
+total = data.get('total', 0)
+shown = len(comments)
+
+def wrap(text, marks):
+    for m in marks or []:
+        t = m.get('type')
+        if   t == 'code':   text = '`%s`' % text
+        elif t == 'strong': text = '**%s**' % text
+        elif t == 'em':     text = '*%s*' % text
+        elif t == 'strike': text = '~~%s~~' % text
+        elif t == 'link':   text = '[%s](%s)' % (text, (m.get('attrs') or {}).get('href', ''))
+    return text
+
+def inline(nodes):
+    out = ''
+    for n in nodes or []:
+        t = n.get('type')
+        a = n.get('attrs') or {}
+        if   t == 'text':       out += wrap(n.get('text', ''), n.get('marks'))
+        elif t == 'hardBreak':  out += '\n'
+        elif t == 'emoji':      out += a.get('text') or a.get('shortName', '')
+        elif t == 'mention':    out += '@' + (a.get('text') or '').lstrip('@')
+        elif t == 'inlineCard': out += a.get('url', '')
+        elif t == 'status':     out += '[%s]' % a.get('text', '')
+        elif 'content' in n:    out += inline(n['content'])
+    return out
+
+def block(nodes, indent=0):
+    lines = []
+    pad = '  ' * indent
+    for n in nodes or []:
+        t = n.get('type')
+        a = n.get('attrs') or {}
+        if t == 'paragraph':
+            lines.append(pad + inline(n.get('content')))
+        elif t == 'heading':
+            lines.append(pad + '#' * a.get('level', 1) + ' ' + inline(n.get('content')))
+        elif t in ('bulletList', 'orderedList'):
+            ordered = t == 'orderedList'
+            for i, li in enumerate(n.get('content', []), 1):
+                inner = block(li.get('content', []), indent + 1)
+                marker = ('%d.' % i) if ordered else '-'
+                pos = next((k for k, l in enumerate(inner) if l.strip()), None)
+                if pos is None: inner = [pad + marker + ' ']
+                else: inner[pos] = pad + marker + ' ' + inner[pos].lstrip()
+                lines += inner
+        elif t == 'taskList':
+            for ti in n.get('content', []):
+                box = '[x]' if (ti.get('attrs') or {}).get('state') == 'DONE' else '[ ]'
+                lines.append(pad + '- ' + box + ' ' + inline(ti.get('content')))
+        elif t == 'codeBlock':
+            lines.append(pad + '```' + (a.get('language') or ''))
+            lines.append(inline(n.get('content')))
+            lines.append(pad + '```')
+        elif t == 'blockquote':
+            for l in block(n.get('content', []), indent):
+                lines.append((pad + '> ' + l) if l else (pad + '>'))
+        elif t == 'rule':
+            lines.append(pad + '---')
+        elif t == 'panel':
+            lines.append(pad + '[%s]' % (a.get('panelType') or 'note'))
+            lines += block(n.get('content', []), indent)
+        elif t == 'table':
+            for row in n.get('content', []):
+                cells = []
+                for cell in row.get('content', []):
+                    cells.append(' '.join(block(cell.get('content', []))).replace('\n', ' ').strip())
+                lines.append(pad + '| ' + ' | '.join(cells) + ' |')
+        elif 'content' in n:
+            lines += block(n['content'], indent)
+    return lines
+
+if shown < total:
+    print('Showing last %d of %d comments' % (shown, total))
+for c in comments:
+    author = (c.get('author') or {}).get('displayName', 'Unknown')
+    ts = c.get('created', '')[:16].replace('T', ' ')
+    print()
+    print('%s  %s' % (author, ts))
+    body = c.get('body', {})
+    if isinstance(body, dict) and body.get('content'):
+        text = '\n'.join(block(body['content'])).strip('\n')
+        print(text if text.strip() else '  (empty)')
+    elif isinstance(body, str) and body.strip():
+        print(body)
+    else:
+        print('  (empty)')
+    print('---')
+PYEOF
+)"
+}
+
 # Build the "Resolved" comment ADF from gh PR JSON ({body,url}) read from the
 # PR_JSON env var. Emits {"body": <doc>} on stdout. Exits 2 if mistune is
 # missing (with an install hint) so the caller can surface it.
@@ -1222,6 +1330,7 @@ Usage: jr <command> [args]
 Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
+  comments    [TICKET] [N]        Show latest N comments (default 3), rendered — useful for agent context
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   approve     [--force] [--no-sql] [--no-jenkins] [TICKET]
                                   Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
@@ -1250,6 +1359,7 @@ shift 2>/dev/null || true
 case "$cmd" in
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
+  comments)       cmd_comments    "$@" ;;
   resolve)        cmd_resolve     "$@" ;;
   approve)        cmd_approve     "$@" ;;
   merge)          cmd_merge       "$@" ;;
