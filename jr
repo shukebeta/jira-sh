@@ -230,7 +230,7 @@ cmd_comments() {
   local n=3 ticket_arg="."
   local a
   for a in "$@"; do
-    if [[ "$a" =~ ^[0-9]+$ ]]; then n=$a
+    if [[ "$a" =~ ^-[0-9]+$ ]]; then n=${a#-}
     else ticket_arg=$a
     fi
   done
@@ -1330,7 +1330,7 @@ Usage: jr <command> [args]
 Commands:
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
-  comments    [TICKET] [N]        Show latest N comments (default 3), rendered — useful for agent context
+  comments    [TICKET] [-N]       Show latest N comments (default 3), rendered — e.g. -5 for last 5
   resolve     [--force] [TICKET]  Move to review, then fill the review template comment from the current branch's PR (--force overwrites a filled one)
   approve     [--force] [--no-sql] [--no-jenkins] [TICKET]
                                   Finish review: move Review → Test in Branch, then fill the Code Review Checklist (tick Done, keep first 3 + last row, Action: Ready for test).
