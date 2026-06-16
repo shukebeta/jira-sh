@@ -360,6 +360,23 @@ print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
 PYEOF
 }
 
+# Build a lightweight "Review Feedback Resolved" comment ADF for re-resolve
+# (kicked-back tickets). Just a flag + bold heading + PR link.
+_jr_resolve_retry_adf() {
+  PR_JSON="$1" python3 <<'PYEOF'
+import json, os
+FLAG = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
+pr = json.loads(os.environ.get("PR_JSON", "{}"))
+url = pr.get("url", "")
+link = [{"type": "text", "text": url, "marks": [{"type": "link", "attrs": {"href": url}}]}] if url else [{"type": "text", "text": "(no PR link)"}]
+content = [
+    {"type": "paragraph", "content": [FLAG, {"type": "text", "text": " Review Feedback Resolved", "marks": [{"type": "strong"}]}]},
+    {"type": "paragraph", "content": [{"type": "text", "text": "Review feedback addressed — check the latest PR comments: "}, *link]}
+]
+print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
+PYEOF
+}
+
 # POST/PUT a comment body, reporting non-2xx with the server's error messages.
 #   _jr_comment_write POST /issue/K/comment        "$body" "what failed"
 #   _jr_comment_write PUT  /issue/K/comment/<id>   "$body" "what failed"
@@ -383,28 +400,32 @@ except Exception:
   fi
 }
 
-# Classify my Resolved comments on a ticket. Reads the comment list on stdin and
+# Classify Resolved comments on a ticket. Reads the comment list on stdin and
 # my accountId as argv1; prints one of:
-#   TEMPLATE:<id>  an unfilled auto-generated template (has <summary>/<details>/<component>)
-#   FILLED:<id>    a Resolved comment already filled in (placeholders gone)
-#   NONE:          no Resolved comment authored by me
-# A template takes precedence over a filled one if both exist.
+#   TEMPLATE:<id>        unfilled template (any author) — first resolve
+#   TEMPLATE_RETRY:<id>  unfilled template AND a prior filled comment (mine) — re-resolve after kickback
+#   FILLED:<id>          a Resolved comment filled in by me; no pending template
+#   NONE:                no Resolved comment
 _jr_resolved_state() {
   python3 -c "
 import json, sys
 me = sys.argv[1]
 template = filled = None
 for c in json.load(sys.stdin).get('comments', []):
-    if (c.get('author') or {}).get('accountId') != me:
-        continue
     body = json.dumps(c.get('body', {}))
     if 'atlassian-flag_on' not in body:
         continue
+    is_mine = (c.get('author') or {}).get('accountId') == me
     if any(t in body for t in ('<summary>', '<details>', '<component>')):
         template = c['id']
-    else:
+    elif is_mine:
         filled = c['id']
-print('TEMPLATE:' + template if template else ('FILLED:' + filled if filled else 'NONE:'))
+if template:
+    print(('TEMPLATE_RETRY:' if filled else 'TEMPLATE:') + template)
+elif filled:
+    print('FILLED:' + filled)
+else:
+    print('NONE:')
 " "$1"
 }
 
@@ -413,8 +434,8 @@ cmd_resolve() {
   local a
   for a in "$@"; do
     case "$a" in
-      --force) force=1 ;;
-      *)       rest+=("$a") ;;
+      --force|-f) force=1 ;;
+      *)          rest+=("$a") ;;
     esac
   done
   set -- "${rest[@]}"
@@ -442,7 +463,7 @@ cmd_resolve() {
   [[ -n "$me" ]] || { echo "jr: could not determine the current Jira user" >&2; return 1; }
 
   # Move to review first — unless the user already moved it there by hand.
-  local status
+  local status moved=0
   status=$(_jr_api GET "/issue/$ticket?fields=status" | python3 -c "
 import json, sys
 print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', ''))
@@ -452,12 +473,14 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
     echo "$ticket already in '$status' — skipping move"
   else
     cmd_move "$ticket" "review" || return 1
+    moved=1
   fi
 
   # Find (and, if needed, wait for) the review template comment, then fill it in.
   # Moving to review triggers the workflow's auto-template, which can lag a few
-  # seconds; poll for it. If a filled Resolved comment already exists, don't
-  # clobber it unless --force.
+  # seconds; poll for it.  On a re-resolve (kicked-back ticket) there will be a
+  # prior filled comment — in that case post a lightweight follow-up instead of
+  # the full template.
   local tries=10 state cid
   while :; do
     state=$(_jr_api GET "/issue/$ticket/comment" | _jr_resolved_state "$me")
@@ -468,16 +491,31 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
           "failed to update Resolved comment $cid on $ticket" || return 1
         echo "$ticket → Resolved comment filled in (replaced template $cid)"
         return 0 ;;
+      TEMPLATE_RETRY:*)
+        # Re-resolve after kickback: post a lightweight follow-up.
+        local retry_body
+        retry_body=$(_jr_resolve_retry_adf "$pr") || return 1
+        _jr_comment_write POST "/issue/$ticket/comment" "$retry_body" \
+          "failed to post Resolved comment to $ticket" || return 1
+        echo "$ticket → Resolved comment added (review feedback addressed)"
+        return 0 ;;
       FILLED:*)
         cid=${state#FILLED:}
+        # If we just moved the ticket, keep polling — the new template may be lagging.
+        if [[ $moved -eq 1 && $tries -gt 0 ]]; then
+          [[ $tries -eq 10 ]] && echo "jr: waiting for the review template comment to appear…"
+          tries=$((tries - 1)); sleep 2; continue
+        fi
         if [[ $force -eq 1 ]]; then
-          _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$body" \
-            "failed to overwrite Resolved comment $cid on $ticket" || return 1
-          echo "$ticket → Resolved comment overwritten (--force, comment $cid)"
+          local retry_body
+          retry_body=$(_jr_resolve_retry_adf "$pr") || return 1
+          _jr_comment_write POST "/issue/$ticket/comment" "$retry_body" \
+            "failed to post Resolved comment to $ticket" || return 1
+          echo "$ticket → Resolved comment added (review feedback addressed, --force)"
           return 0
         fi
-        echo "jr: $ticket already has a filled Resolved comment ($cid); not overwriting." >&2
-        echo "    Re-run with --force to replace it." >&2
+        echo "jr: $ticket already has a filled Resolved comment ($cid)." >&2
+        echo "    Re-run with --force/-f to add a re-resolve comment." >&2
         return 1 ;;
       *)
         if [[ $tries -gt 0 ]]; then
