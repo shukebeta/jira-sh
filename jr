@@ -1504,13 +1504,13 @@ def _inline(children):
         elif t == "strong":
             kids = _inline(tok.get("children", []))
             for n in kids:
-                if n.get("type") == "text":
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
                     n.setdefault("marks", []).append({"type": "strong"})
             out.extend(kids)
         elif t == "emphasis":
             kids = _inline(tok.get("children", []))
             for n in kids:
-                if n.get("type") == "text":
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
                     n.setdefault("marks", []).append({"type": "em"})
             out.extend(kids)
         elif t in ("linebreak", "softbreak"):
@@ -1737,13 +1737,13 @@ def _inline(children):
         elif t == "strong":
             kids = _inline(tok.get("children", []))
             for n in kids:
-                if n.get("type") == "text":
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
                     n.setdefault("marks", []).append({"type": "strong"})
             out.extend(kids)
         elif t == "emphasis":
             kids = _inline(tok.get("children", []))
             for n in kids:
-                if n.get("type") == "text":
+                if n.get("type") == "text" and not any(m.get("type") == "code" for m in n.get("marks", [])):
                     n.setdefault("marks", []).append({"type": "em"})
             out.extend(kids)
         elif t in ("linebreak", "softbreak"):
