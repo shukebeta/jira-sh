@@ -1538,6 +1538,8 @@ Commands:
                                   --no-sql / --no-jenkins drop the SQL / Jenkins rows for tickets with no SQL changes or projects with no Jenkins pipeline.
                                   Short forms bundle: -s (no-sql), -j (no-jenkins), -f (force) — e.g. -sj skips both, -sjf also overwrites.
   merge       [--force] [TICKET]  Merge the approved PR (squash if yours, merge otherwise), move Merge → Test in Main, then fill the Merge Results template
+  create      --title "..." [--body "..." | --body-file path] [--priority P] [--points N] [--type T] [--epic KEY] [--no-sprint] [--dry-run]
+                                  Create a new ticket (defaults from ~/.jr.toml; --dry-run prints the JSON payload without creating)
   edit        [TICKET] [--title "..."] [--body "..." | --body-file path] [--dry-run]
                                   Update the title and/or body of a ticket you reported (reporter-only guard)
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
