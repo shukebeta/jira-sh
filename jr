@@ -1149,6 +1149,102 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
   done
 }
 
+cmd_set_field() {
+  # jr set-field <TICKET> <FIELD> <VALUE>        — set a field (select: {"value":"V"}, raw JSON: pass {…})
+  # jr set-field <TICKET> <FIELD> --list-options — list allowed option values for a select field
+  [[ $# -lt 2 ]] && {
+    echo "Usage: jr set-field <TICKET> <FIELD> <VALUE|--list-options>" >&2
+    echo "  FIELD: customfield_XXXXX or a case-insensitive name (e.g. CapEx)" >&2
+    return 1
+  }
+  local ticket field_input value_input
+  ticket=$(_jr_resolve_ticket "$1") || return 1
+  field_input=$2; value_input=${3:-}
+
+  # Resolve field name → ID
+  local field_id field_name
+  if [[ "$field_input" =~ ^customfield_[0-9]+$ ]]; then
+    field_id=$field_input; field_name=$field_input
+  else
+    local fields_json resolved
+    fields_json=$(_jr_api GET "/field") || { echo "jr: failed to fetch field list" >&2; return 1; }
+    resolved=$(echo "$fields_json" | python3 -c "
+import json, sys
+target = sys.argv[1].lower()
+fs = json.load(sys.stdin)
+for f in fs:
+    if f.get('name','').lower() == target:
+        print(f['id'] + '|' + f.get('name','')); sys.exit(0)
+matches = [f for f in fs if target in f.get('name','').lower()]
+if len(matches) == 1:
+    print(matches[0]['id'] + '|' + matches[0].get('name','')); sys.exit(0)
+if len(matches) > 1:
+    print('AMBIGUOUS:' + '||'.join(f['id']+':'+f['name'] for f in matches[:10]))
+else:
+    print('NONE:')
+" "$field_input")
+    case "$resolved" in
+      AMBIGUOUS:*) echo "jr: '$field_input' matches multiple fields — be more specific:" >&2
+                   echo "${resolved#AMBIGUOUS:}" | tr '|' '\n' | grep ':' | sed 's/^/  /' >&2
+                   return 1 ;;
+      NONE:)       echo "jr: no field matching '$field_input'" >&2; return 1 ;;
+      *'|'*)       field_id=${resolved%%|*}; field_name=${resolved#*|} ;;
+      *)           echo "jr: unexpected field resolution: $resolved" >&2; return 1 ;;
+    esac
+  fi
+
+  # --list-options: show allowed values via issue editmeta (no admin needed)
+  if [[ "$value_input" == "--list-options" ]]; then
+    _jr_api GET "/issue/$ticket/editmeta" | python3 -c "
+import json, sys
+fid = sys.argv[1]
+f = json.load(sys.stdin).get('fields', {}).get(fid, {})
+name = f.get('name', fid)
+allowed = f.get('allowedValues', [])
+if not allowed:
+    print(f'jr: no options found for {name} ({fid}) — may not be a select field', file=sys.stderr)
+    sys.exit(1)
+print(f'Options for {name} ({fid}):')
+for opt in allowed:
+    val = opt.get('value') or opt.get('name', '')
+    print('  id=%-8s  %s' % (opt.get('id',''), val))
+" "$field_id"
+    return $?
+  fi
+
+  [[ -z "$value_input" ]] && {
+    echo "Usage: jr set-field <TICKET> <FIELD> <VALUE|--list-options>" >&2; return 1
+  }
+
+  # Build PATCH value: raw JSON passthrough, numbers as-is, else wrap in {"value":"..."}
+  local field_value
+  if [[ "$value_input" == \{* || "$value_input" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    field_value=$value_input
+  else
+    field_value="{\"value\":\"$value_input\"}"
+  fi
+
+  local resp code body
+  resp=$(_jr_api_status PATCH "/issue/$ticket" "{\"fields\":{\"$field_id\":$field_value}}")
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}
+
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "jr: failed to set ${field_name:-$field_id} on $ticket (HTTP $code)" >&2
+    echo "$body" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    for m in d.get('errorMessages', []): print('   ', m)
+    for k, v in d.get('errors', {}).items(): print(f'    {k}: {v}')
+except Exception:
+    pass
+" >&2
+    echo "    Hint: jr set-field $ticket $field_id --list-options" >&2
+    return 1
+  fi
+  echo "$ticket  ${field_name:-$field_id} = $value_input"
+}
+
 cmd_transitions() {
   [[ $# -lt 1 ]] && { echo "Usage: jr transitions <TICKET>" >&2; return 1; }
   local ticket
@@ -1444,6 +1540,10 @@ Output a ready-to-save ~/.jr.toml in this format:
     # fields Jira rejects as missing; look up their option ids from an existing ticket).
     # [create.extra_fields]
     # customfield_XXXXX = {id = "YYYYY"}
+    #
+    # Example: pre-set CapEx so the Ready transition never blocks for this field:
+    # [create.extra_fields]
+    # customfield_11902 = {value = "No"}   # CapEx — set to "Yes" if this is CapEx work
 ---
 
 Once saved, re-run your `jr create` command.
@@ -1920,6 +2020,11 @@ Commands:
                                   Update the title and/or body of a ticket you reported; --force/-f edits any ticket
   open        [-p] [TICKET]       Open ticket in the browser (-p / --print to only echo the URL)
   view        [TICKET]            Show a ticket's fields and full description (rendered) — enough to understand the task + A/C
+  set-field   <TICKET> <FIELD> <VALUE|--list-options>
+                                Set a custom field on a ticket. FIELD accepts a customfield_XXXXX ID
+                                or a case-insensitive name (e.g. CapEx). VALUE is the option label
+                                for select fields, a number, or raw JSON ({…}). Use --list-options
+                                to discover allowed values for a select field.
   transitions <TICKET>            List available transitions for a ticket
   assign      <TICKET> [NAME]     Assign ticket to a user (fuzzy name/email match); NAME omitted = assign to yourself
   users       <TICKET> [query]    List assignable users for a ticket
@@ -1955,6 +2060,7 @@ case "$cmd" in
   edit)           cmd_edit        "$@" ;;
   open)           cmd_open        "$@" ;;
   view)           cmd_view        "$@" ;;
+  set-field|sf)   cmd_set_field   "$@" ;;
   transitions)    cmd_transitions "$@" ;;
   assign)         cmd_assign      "$@" ;;
   users)          cmd_users       "$@" ;;
