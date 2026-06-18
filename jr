@@ -406,6 +406,9 @@ Q = {"type": "emoji", "attrs": {"shortName": ":question:", "id": "atlassian-ques
 def add_mark(nodes, mark):
     for n in nodes:
         if n.get("type") == "text":
+            # ADF rejects code+strong or code+em on the same node; drop the outer mark.
+            if mark.get("type") in ("strong", "em") and any(m.get("type") == "code" for m in n.get("marks", [])):
+                continue
             n.setdefault("marks", []).append(mark)
     return nodes
 
