@@ -39,6 +39,7 @@ number (`jr view 63504`) is resolved against `JIRA_PROJECT_PREFIXES`.
 
 | Command | What it does |
 | --- | --- |
+| `start [TICKET]` | Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump. Claims the ticket; handles the CapEx gate. |
 | `move <TICKET> <STATUS>` | Transition a ticket (moving to In Progress claims it for you; errors if owned by someone else). |
 | `comment <TICKET> <TEXT>` | Add a comment. |
 | `view [TICKET]` | Show a ticket's fields and full rendered description. |

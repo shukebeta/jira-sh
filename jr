@@ -255,6 +255,47 @@ print(a.get('emailAddress', ''))
   echo "$ticket → $dest"
 }
 
+# Start work on a ticket: reach "In Progress" from wherever it is now. Jira's
+# workflow blocks a direct Refinement/Analysis → In Progress jump, so when the
+# direct transition is missing we hop through "Ready" first. Delegates each hop
+# to cmd_move, which claims the ticket and handles the CapEx/Time-Spent gates.
+cmd_start() {
+  local ticket
+  ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
+
+  local transitions
+  transitions=$(_jr_api GET "/issue/$ticket/transitions") \
+    || { echo "jr: ticket not found: $ticket" >&2; return 1; }
+
+  # Classify the reachable destinations in one pass: is "In Progress" directly
+  # available, and failing that, is "Ready" available as a stepping stone?
+  local reach
+  reach=$(echo "$transitions" | python3 -c "
+import json, sys
+dests = [t.get('to', {}).get('name', '').lower() for t in json.loads(sys.stdin.read()).get('transitions', [])]
+if any('in progress' in d for d in dests): print('DIRECT')
+elif any(d == 'ready' for d in dests):     print('VIA_READY')
+else:                                       print('NONE')
+")
+
+  case "$reach" in
+    DIRECT)
+      cmd_move "$ticket" "In Progress" ;;
+    VIA_READY)
+      echo "$ticket: In Progress not directly reachable — hopping through Ready."
+      cmd_move "$ticket" "Ready" || return 1
+      cmd_move "$ticket" "In Progress" ;;
+    *)
+      echo "jr: cannot reach 'In Progress' from $ticket's current status. Available targets:" >&2
+      echo "$transitions" | python3 -c "
+import json, sys
+for t in json.loads(sys.stdin.read()).get('transitions', []):
+    print(' ', t.get('to', {}).get('name', t['name']))
+" >&2
+      return 1 ;;
+  esac
+}
+
 cmd_comment() {
   [[ $# -lt 2 ]] && { echo "Usage: jr comment <TICKET> <TEXT>" >&2; return 1; }
   local ticket
@@ -593,6 +634,24 @@ cmd_resolve() {
   ticket=$(_jr_resolve_ticket "${1:-.}") || return 1
 
   command -v gh >/dev/null 2>&1 || { echo "jr: gh CLI not found (needed to read the PR)" >&2; return 1; }
+
+  # The Resolved comment is built from the *remote* PR (gh pr view). If the local
+  # branch has uncommitted or unpushed work, that comment silently omits it —
+  # resolve looks successful but lands stale. Warn before proceeding (--force skips).
+  if [[ $force -eq 0 ]]; then
+    local dirty="" unpushed=""
+    [[ -n "$(git status --porcelain 2>/dev/null)" ]] && dirty=1
+    git rev-parse '@{u}' >/dev/null 2>&1 \
+      && [[ -n "$(git rev-list '@{u}..HEAD' 2>/dev/null)" ]] && unpushed=1
+    if [[ -n "$dirty" || -n "$unpushed" ]]; then
+      [[ -n "$dirty"    ]] && echo "jr: working tree has uncommitted changes." >&2
+      [[ -n "$unpushed" ]] && echo "jr: branch has commits not pushed to the PR's remote." >&2
+      echo "    The Resolved comment is built from the pushed PR and won't include them." >&2
+      local cont
+      read -r -p "Resolve anyway? [y/N] " cont
+      [[ "${cont,,}" == "y" ]] || { echo "aborted — push your work first, or use --force." >&2; return 1; }
+    fi
+  fi
 
   # PR for the current branch.
   local pr
@@ -2009,6 +2068,7 @@ cmd_help() {
 Usage: jr <command> [args]
 
 Commands:
+  start       [TICKET]            Start work: reach In Progress in one hop, or via Ready when Jira blocks the direct jump (claims the ticket; handles CapEx)
   move        <TICKET> <STATUS>   Transition a ticket to a new status (moving to In Progress claims it for you; errors if owned by someone else)
   comment     <TICKET> <TEXT>     Add a comment to a ticket
   comments    [TICKET] [-N]       Show latest N comments (default 3), rendered — e.g. -5 for last 5
@@ -2056,6 +2116,7 @@ _jr_check_env
 cmd=${1:-help}
 shift 2>/dev/null || true
 case "$cmd" in
+  start)          cmd_start       "$@" ;;
   move|mv)        cmd_move        "$@" ;;
   comment)        cmd_comment     "$@" ;;
   comments)       cmd_comments    "$@" ;;
