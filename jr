@@ -518,18 +518,42 @@ def blocks(tokens):
             out.append({"type": "paragraph", "content": [{"type": "text", "text": tok["raw"]}]})
     return out
 
+# Lists under these headings are test plans / process checklists, not changes.
+SKIP_HEADING = re.compile(r"test|checklist|how\s+to|qa|verif|deploy", re.I)
+# A "- [ ] ..." / "- [x] ..." item is a checkbox, never a change description.
+CHECKBOX = re.compile(r"^\s*\[[ xX]?\]")
+
+def _text_of(nodes):
+    parts = []
+    for n in nodes or []:
+        if n.get("type") == "text":
+            parts.append(n.get("text", ""))
+        else:
+            parts.append(_text_of(n.get("content")))
+    return "".join(parts)
+
 def list_items(tokens):
-    """Collect every list's items into a flat sequence of ADF listItems.
-    Headings, prose, code blocks and test plans are dropped — the Team Leader
-    wants a short list of changes, not the whole PR body."""
+    """Collect change-list items into a flat sequence of ADF listItems.
+
+    Headings and prose are dropped, and so are *test plans / checklists* — both
+    the lists that sit under a Test/Checklist/Deploy heading and individual
+    "- [ ]" checkbox items wherever they appear. The Team Leader wants a short
+    list of what changed, not the PR's own process checklist (the Resolved
+    template already carries its own Checklist section)."""
     items = []
+    heading = ""
     for tok in tokens or []:
-        if tok.get("type") == "list":
+        t = tok.get("type")
+        if t == "heading":
+            heading = "".join(c.get("raw", "") for c in tok.get("children", []))
+        elif t == "list":
+            if SKIP_HEADING.search(heading):
+                continue
             for li in tok.get("children", []):
                 inner = blocks(li.get("children", [])) or [{"type": "paragraph"}]
+                if CHECKBOX.match(_text_of(inner[0].get("content"))):
+                    continue
                 items.append({"type": "listItem", "content": inner})
-        elif tok.get("children"):
-            items.extend(list_items(tok.get("children", [])))
     return items
 
 md = mistune.create_markdown(renderer=None)
