@@ -600,19 +600,30 @@ print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
 PYEOF
 }
 
-# Build a lightweight "Review Feedback Resolved" comment ADF for re-resolve
-# (kicked-back tickets). Just a flag + bold heading + PR link.
+# Build the re-resolve comment ADF for a kicked-back ticket. Moving back to
+# review re-triggers the workflow's template, so we edit *that* comment in
+# place: keep its title (the first content node) and replace the whole
+# checklist body with a one-line "review feedback addressed" note + PR link.
+# argv: $1 = the existing comment object (from GET .../comment/<id>), $2 = PR JSON.
 _jr_resolve_retry_adf() {
-  PR_JSON="$1" python3 <<'PYEOF'
+  ORIG_JSON="$1" PR_JSON="$2" python3 <<'PYEOF'
 import json, os
 FLAG = {"type": "emoji", "attrs": {"shortName": ":flag_on:", "id": "atlassian-flag_on", "text": ":flag_on:"}}
+orig = json.loads(os.environ.get("ORIG_JSON", "{}"))
 pr = json.loads(os.environ.get("PR_JSON", "{}"))
 url = pr.get("url", "")
 link = [{"type": "text", "text": url, "marks": [{"type": "link", "attrs": {"href": url}}]}] if url else [{"type": "text", "text": "(no PR link)"}]
-content = [
-    {"type": "paragraph", "content": [FLAG, {"type": "text", "text": " Review Feedback Resolved", "marks": [{"type": "strong"}]}]},
-    {"type": "paragraph", "content": [{"type": "text", "text": "Review feedback addressed — check the latest PR comments: "}, *link]}
-]
+
+# Keep the template's own title (its first content node). Fall back to a flagged
+# heading if the existing comment has no content — keeps the atlassian-flag_on
+# marker so _jr_resolved_state still recognises this as a filled comment.
+orig_content = (orig.get("body") or {}).get("content") or []
+title = [orig_content[0]] if orig_content else [
+    {"type": "paragraph", "content": [FLAG, {"type": "text", "text": " Review Feedback Resolved", "marks": [{"type": "strong"}]}]}]
+
+sentence = {"type": "paragraph", "content": [
+    {"type": "text", "text": "Review feedback addressed — check the latest PR commits: "}, *link]}
+content = title + [sentence]
 print(json.dumps({"body": {"type": "doc", "version": 1, "content": content}}))
 PYEOF
 }
@@ -750,12 +761,16 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
         echo "$ticket → Resolved comment filled in (replaced template $cid)"
         return 0 ;;
       TEMPLATE_RETRY:*)
-        # Re-resolve after kickback: post a lightweight follow-up.
-        local retry_body
-        retry_body=$(_jr_resolve_retry_adf "$pr") || return 1
-        _jr_comment_write POST "/issue/$ticket/comment" "$retry_body" \
-          "failed to post Resolved comment to $ticket" || return 1
-        echo "$ticket → Resolved comment added (review feedback addressed)"
+        # Re-resolve after kickback: the move re-triggered the template, so edit
+        # that comment in place (keep its title, swap the body) instead of
+        # posting a new one.
+        cid=${state#TEMPLATE_RETRY:}
+        local orig retry_body
+        orig=$(_jr_api GET "/issue/$ticket/comment/$cid") || return 1
+        retry_body=$(_jr_resolve_retry_adf "$orig" "$pr") || return 1
+        _jr_comment_write PUT "/issue/$ticket/comment/$cid" "$retry_body" \
+          "failed to update Resolved comment $cid on $ticket" || return 1
+        echo "$ticket → Resolved comment updated (review feedback addressed, template $cid)"
         return 0 ;;
       FILLED:*)
         cid=${state#FILLED:}
@@ -765,8 +780,10 @@ print((json.load(sys.stdin).get('fields', {}).get('status') or {}).get('name', '
           tries=$((tries - 1)); sleep 2; continue
         fi
         if [[ $force -eq 1 ]]; then
+          # No fresh template here — post a standalone note (empty orig → it
+          # uses the built-in flagged title).
           local retry_body
-          retry_body=$(_jr_resolve_retry_adf "$pr") || return 1
+          retry_body=$(_jr_resolve_retry_adf "{}" "$pr") || return 1
           _jr_comment_write POST "/issue/$ticket/comment" "$retry_body" \
             "failed to post Resolved comment to $ticket" || return 1
           echo "$ticket → Resolved comment added (review feedback addressed, --force)"
