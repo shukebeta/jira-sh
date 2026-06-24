@@ -66,6 +66,14 @@ skipped and the comment is still filled. A checklist already authored by someone
 else is left untouched; an already-filled comment is not overwritten unless you
 pass `--force`.
 
+### `jr resolve`
+
+Moves a ticket → Review, then fills the auto-generated **Resolved** comment from
+the current branch's PR: a short bulleted change summary, the PR link, and the
+team's review **Checklist**. The first checklist item — *DDT script run using
+DFXDDT & in correct folder* — is answered **Yes** automatically when the PR adds
+a new file under `DFXSQL/DDT/UpdateScripts/`; otherwise it's left open.
+
 ### `jr approve`
 
 Moves Review → Test in Branch, then fills the auto-generated **Code Review

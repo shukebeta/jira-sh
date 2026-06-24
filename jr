@@ -418,7 +418,7 @@ PYEOF
 # PR_JSON env var. Emits {"body": <doc>} on stdout. Exits 2 if mistune is
 # missing (with an install hint) so the caller can surface it.
 _jr_resolve_adf() {
-  PR_JSON="$1" python3 <<'PYEOF'
+  PR_JSON="$1" DDT_FILES="$2" python3 <<'PYEOF'
 import json, os, re, sys
 
 try:
@@ -436,6 +436,17 @@ except Exception as e:
 
 body_md = (pr.get("body") or "").strip()
 url = pr.get("url") or ""
+
+# A newly-added file under DFXSQL/DDT/UpdateScripts/ means a DDT script was
+# introduced in the correct folder — auto-answer the DDT checklist item "Yes".
+# DDT_FILES is one "status<TAB>filename" line per PR file (from the REST files
+# endpoint, since gh pr view --json files carries no file status).
+ddt_yes = False
+for _line in (os.environ.get("DDT_FILES") or "").splitlines():
+    st, _, fn = _line.partition("\t")
+    if st == "added" and re.match(r"^DFXSQL/DDT/UpdateScripts/", fn):
+        ddt_yes = True
+        break
 
 # Drop the trailing "Generated with [Claude Code]" footer (and a dangling rule).
 kept = [ln for ln in body_md.split("\n") if "Generated with [Claude Code]" not in ln]
@@ -584,7 +595,11 @@ CHECKLIST = [
     "API: Source code comments for interface changes - ",
     "Privacy concerns resolved - ",
 ]
-checklist = [{"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": it}, Q]}]} for it in CHECKLIST]
+# Item 0 (the DDT item) is answered "Yes" when the PR added a DDT script in the
+# correct folder; every other item stays a question mark for the reviewer.
+def _suffix(i):
+    return {"type": "text", "text": "Yes"} if (i == 0 and ddt_yes) else Q
+checklist = [{"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": it}, _suffix(i)]}]} for i, it in enumerate(CHECKLIST)]
 
 pr_link = [{"type": "text", "text": url, "marks": [{"type": "link", "attrs": {"href": url}}]}] if url else [{"type": "text", "text": "(no PR link)"}]
 
@@ -723,9 +738,24 @@ cmd_resolve() {
     return 1
   fi
 
+  # Detect newly-added DFXSQL/DDT/UpdateScripts files so the DDT checklist item
+  # can be auto-answered "Yes". gh pr view --json files carries no file status,
+  # so hit the REST files endpoint (owner/repo/number parsed from the PR URL).
+  local ddt_files="" pr_url api
+  pr_url=$(printf '%s' "$pr" | python3 -c "import json,sys;print(json.load(sys.stdin).get('url') or '')")
+  api=$(printf '%s' "$pr_url" | python3 -c "
+import re, sys
+m = re.search(r'/([^/]+/[^/]+)/(?:pull|pulls)/(\d+)', sys.stdin.read())
+print(f'repos/{m.group(1)}/pulls/{m.group(2)}/files' if m else '')")
+  if [[ -n "$api" ]]; then
+    ddt_files=$(gh api "$api" --paginate --jq '.[] | .status + "\t" + .filename' 2>/dev/null) || ddt_files=""
+  fi
+  [[ -n "$ddt_files" ]] && grep -q $'^added\tDFXSQL/DDT/UpdateScripts/' <<<"$ddt_files" \
+    && echo "jr: newly added DFXSQL/DDT/UpdateScripts file detected — marking DDT checklist item Yes."
+
   # Build the Resolved comment from the PR data (mistune renders the body).
   local body
-  body=$(_jr_resolve_adf "$pr") || return 1
+  body=$(_jr_resolve_adf "$pr" "$ddt_files") || return 1
 
   local me
   me=$(_jr_api GET "/myself" | python3 -c "import json, sys; print(json.load(sys.stdin).get('accountId', ''))")
